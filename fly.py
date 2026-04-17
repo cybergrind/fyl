@@ -12,7 +12,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import copyfile
-from typing import Tuple
 
 import fuse
 
@@ -203,7 +202,7 @@ class FileStructure:
             res += struct.pack('Q', offset)
         return res
 
-    def add(self, fname, size) -> Tuple[FileRecord, int]:
+    def add(self, fname, size) -> tuple[FileRecord, int]:
         log.debug(f'{self.base_offset=}')
         if fname in self.files_dict:
             log.debug('return existing record')
@@ -227,7 +226,7 @@ class FileStructure:
         self.base_offset = last_file.offset + last_file.size + 8
         return record, last_file.offset + last_file.size
 
-    def update_size(self, fname, new_size) -> Tuple[FileRecord, int]:
+    def update_size(self, fname, new_size) -> tuple[FileRecord, int]:
         record = self.files_dict[fname]
         log.debug(f'Update size {fname=} {record.size} => {new_size}')
         record.size = new_size
@@ -260,9 +259,7 @@ class Fly(fuse.Fuse):
             fs_size = struct.unpack('Q', fs_size_packed)[0]
             log.debug(f'{meta_offset=} {fs_size=}')
             fs_bytes = self.file_wrapper.read(fs_size, meta_offset + 8)
-        base_offset = (
-            (meta_offset if meta_offset > 0 else self.dst.stat().st_size) + len(MAGIC_BYTES) + 8
-        )
+        base_offset = (meta_offset if meta_offset > 0 else self.dst.stat().st_size) + len(MAGIC_BYTES) + 8
         log.debug(f'Original file size: {self.dst.stat().st_size} {base_offset=}')
         self.fs_structure = FileStructure(fs_bytes, base_offset)
         log.info(f'Init FS with {len(self.fs_structure.files_list)} files')
@@ -343,12 +340,8 @@ class Fly(fuse.Fuse):
                 log.debug('has meta offset')
                 record = self.fs_structure.files_dict[path]
                 if record.size < len(buf) + offset:
-                    record, self.meta_offset = self.fs_structure.update_size(
-                        path, len(buf) + offset
-                    )
-            log.debug(
-                f'record offset = {record.offset} {record.size} {self.fs_structure.base_offset=}'
-            )
+                    record, self.meta_offset = self.fs_structure.update_size(path, len(buf) + offset)
+            log.debug(f'record offset = {record.offset} {record.size} {self.fs_structure.base_offset=}')
             self.file_wrapper.write(record.offset + offset, buf)
             struct_bytes = self.fs_structure.pack()
             self.file_wrapper.write(self.meta_offset, struct.pack('Q', len(struct_bytes)))
@@ -415,9 +408,7 @@ class Fly(fuse.Fuse):
             log.debug(f'Iterate over list: {self.fs_structure.files_list}')
 
             for file_record in self.fs_structure.files_list:
-                log.debug(
-                    f'processing {file_record.name=} {file_record.size=} {file_record.offset=}'
-                )
+                log.debug(f'processing {file_record.name=} {file_record.size=} {file_record.offset=}')
                 if is_first:
                     is_first = False
                     temp_handler.write(read_handle.read(file_record.offset))
@@ -444,9 +435,7 @@ class Fly(fuse.Fuse):
 
             self.file_wrapper.reset_handlers()
             log.debug(f'{temp.name} => {self.dst}')
-            log.debug(
-                f'old: {self.dst.stat().st_size} new: {Path(temp.name).stat().st_size} {current_base=}'
-            )
+            log.debug(f'old: {self.dst.stat().st_size} new: {Path(temp.name).stat().st_size} {current_base=}')
             copyfile(temp.name, self.dst)
             os.unlink(temp.name)
 
@@ -469,7 +458,6 @@ class Fly(fuse.Fuse):
     # change owner
     def chown(self, path, uid, gid):
         return 0
-
 
     def rename(self, old, new):
         self._ctime = time.time()
