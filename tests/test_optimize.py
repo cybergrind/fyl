@@ -186,6 +186,267 @@ class TestOptimizePasswordless:
         assert alpha_ro.volume.list() == []
 
 
+class TestOptimizeRegressions:
+    """User-reported bugs reproduced at the Stash/FUSE level."""
+
+    def test_optimize_refuses_while_backing_file_is_open(self, multi_stash, fast_kdf):
+        """Reproduces the user-reported EIO scenario.
+
+        The user ran ``stashfs optimize cover.png`` while the FUSE
+        mount was still live. ``_looks_like_fuse_mount`` only checks
+        the *mountpoint* path (``/tmp/aaa``), not the backing file,
+        so the check passed and optimize rebuilt the file. After the
+        atomic rename, the live mount's in-memory allocation still
+        referenced chunks at offsets beyond the new file's size;
+        subsequent reads saw ``CoverStorage.size()`` shrink and
+        returned short reads — AES-GCM then refused to decrypt the
+        truncated frames, surfacing as ``EIO`` at every file.
+
+        The fix is an advisory ``flock`` on the backing file: the
+        mount holds ``LOCK_SH`` for its entire lifetime; optimize
+        requires ``LOCK_EX`` and refuses if anything else is holding
+        the file open.
+        """
+        alpha = multi_stash.mount('alpha')
+        assert alpha.mkdir('/stashfs', 0o755) == 0
+        assert alpha.mknod('/stashfs/a.py', 0o644, 0) == 0
+        assert alpha.write('/stashfs/a.py', b'payload', 0) == 7
+        # Do NOT unmount — the mount's FileWrapper still holds the
+        # shared lock on the backing file.
+
+        before = multi_stash.path.read_bytes()
+        with pytest.raises(OptimizeError, match='in use'):
+            optimize(multi_stash.path, [], kdf=fast_kdf)
+        assert multi_stash.path.read_bytes() == before
+
+    def test_cp_rename_rmrf_cp_optimize(self, multi_stash, fast_kdf):
+        """User variant: cp, rename subtree, rm -rf renamed, cp again, optimize."""
+        # Seed slot 0.
+        empty = multi_stash.mount('')
+        empty_data = b'empty-bytes-' * 2048
+        assert empty.mknod('/keep.bin', 0o644, 0) == 0
+        assert empty.write('/keep.bin', empty_data, 0) == len(empty_data)
+
+        alpha = multi_stash.mount('alpha')
+        files_relative = ['a.py', 'b.py', 'c.py', 'nested/x.py', 'nested/y.py']
+
+        def payload(tag: str, i: int, size: int = 22_000) -> bytes:
+            base = f'{tag}-{i}-'.encode()
+            return (base * (size // len(base) + 1))[:size]
+
+        def chunked_write(path: str, data: bytes) -> None:
+            assert alpha.mknod(path, 0o644, 0) == 0
+            for off in range(0, len(data), 4096):
+                block = data[off : off + 4096]
+                assert alpha.write(path, block, off) == len(block)
+
+        # Round 1: cp -r stashfs /
+        assert alpha.mkdir('/stashfs', 0o755) == 0
+        assert alpha.mkdir('/stashfs/nested', 0o755) == 0
+        for i, rel in enumerate(files_relative):
+            chunked_write(f'/stashfs/{rel}', payload('v1', i))
+
+        # mv stashfs backup
+        assert alpha.rename('/stashfs', '/backup') == 0
+
+        # rm -rf backup
+        for rel in files_relative:
+            assert alpha.unlink(f'/backup/{rel}') == 0
+        assert alpha.rmdir('/backup/nested') == 0
+        assert alpha.rmdir('/backup') == 0
+
+        # Round 2: cp -r stashfs / again (new content)
+        assert alpha.mkdir('/stashfs', 0o755) == 0
+        assert alpha.mkdir('/stashfs/nested', 0o755) == 0
+        final = {}
+        for i, rel in enumerate(files_relative):
+            data = payload('v2', i)
+            chunked_write(f'/stashfs/{rel}', data)
+            final[f'stashfs/{rel}'] = data
+
+        multi_stash.unmount_all()
+        old_size = multi_stash.path.stat().st_size
+        report = optimize(multi_stash.path, [], kdf=fast_kdf)
+        new_size = multi_stash.path.stat().st_size
+        assert set(report.rebuilt_slots) == {0, 1}
+        assert new_size < old_size
+
+        empty_ro = multi_stash.mount('')
+        assert empty_ro.read('/keep.bin', len(empty_data), 0) == empty_data
+
+        alpha_ro = multi_stash.mount('alpha')
+        for name, expected in final.items():
+            got = alpha_ro.read(f'/{name}', len(expected), 0)
+            assert got == expected, f'content mismatch for {name}'
+
+    def test_mixed_slot_churn_optimize(self, multi_stash, fast_kdf):
+        """Both slot 0 (empty) and slot 1 (alpha) touched, mirroring the
+        user's ``slots rebuilt=[0, 1]`` optimize report.
+
+        The empty-password volume gets a long-lived file so slot 0 stays
+        occupied throughout; slot 1 undergoes the heavy cp/rm churn.
+        """
+        import hashlib as _hashlib
+
+        # Seed slot 0 with a single long-lived file.
+        empty = multi_stash.mount('')
+        empty_data = b'public-bytes-' * 4096
+        assert empty.mknod('/public.bin', 0o644, 0) == 0
+        assert empty.write('/public.bin', empty_data, 0) == len(empty_data)
+        empty_hash = _hashlib.sha256(empty_data).hexdigest()
+
+        # Slot 1 churn.
+        alpha = multi_stash.mount('alpha')
+        top = ['stashfs/a.py', 'stashfs/b.py', 'stashfs/c.py', 'stashfs/d.py']
+        nested = ['stashfs/__pycache__/a.pyc', 'stashfs/__pycache__/b.pyc']
+
+        def payload(tag: str, i: int, size: int = 25_000) -> bytes:
+            base = f'{tag}-{i}-'.encode()
+            return (base * (size // len(base) + 1))[:size]
+
+        def write_chunked(path: str, data: bytes) -> None:
+            assert alpha.mknod(path, 0o644, 0) == 0
+            for off in range(0, len(data), 4096):
+                block = data[off : off + 4096]
+                assert alpha.write(path, block, off) == len(block)
+
+        for iteration in range(4):
+            assert alpha.mkdir('/stashfs', 0o755) == 0
+            assert alpha.mkdir('/stashfs/__pycache__', 0o755) == 0
+            content = {n: payload(f'iter{iteration}', i) for i, n in enumerate(top + nested)}
+            for name, data in content.items():
+                write_chunked(f'/{name}', data)
+            if iteration < 3:
+                for n in nested:
+                    assert alpha.unlink(f'/{n}') == 0
+                assert alpha.rmdir('/stashfs/__pycache__') == 0
+                for n in top:
+                    assert alpha.unlink(f'/{n}') == 0
+                assert alpha.rmdir('/stashfs') == 0
+
+        final_content = content
+
+        multi_stash.unmount_all()
+        old_size = multi_stash.path.stat().st_size
+        report = optimize(multi_stash.path, [], kdf=fast_kdf)
+        new_size = multi_stash.path.stat().st_size
+        assert set(report.rebuilt_slots) == {0, 1}
+        assert new_size < old_size
+
+        # Both slots still intact.
+        empty_ro = multi_stash.mount('')
+        got_empty = empty_ro.read('/public.bin', len(empty_data), 0)
+        assert _hashlib.sha256(got_empty).hexdigest() == empty_hash
+
+        alpha_ro = multi_stash.mount('alpha')
+        for name, expected in final_content.items():
+            got = alpha_ro.read(f'/{name}', len(expected), 0)
+            assert got == expected, f'content mismatch for {name}'
+
+    def test_cp_rmrf_multiple_iterations_optimize(self, multi_stash, fast_kdf):
+        """Multiple cp/rm iterations like the user's real workflow."""
+        alpha = multi_stash.mount('alpha')
+        top = ['stashfs/a.py', 'stashfs/b.py', 'stashfs/c.py']
+        nested = ['stashfs/__pycache__/a.pyc', 'stashfs/__pycache__/b.pyc']
+
+        def payload(tag: str, i: int, size: int = 18_000) -> bytes:
+            base = f'{tag}-{i}-'.encode()
+            return (base * (size // len(base) + 1))[:size]
+
+        def write_chunked(path: str, data: bytes) -> None:
+            """Simulate cp's chunked writes (default 4 KiB)."""
+            assert alpha.mknod(path, 0o644, 0) == 0
+            for off in range(0, len(data), 4096):
+                block = data[off : off + 4096]
+                assert alpha.write(path, block, off) == len(block)
+
+        for iteration in range(3):
+            assert alpha.mkdir('/stashfs', 0o755) == 0
+            assert alpha.mkdir('/stashfs/__pycache__', 0o755) == 0
+            content = {n: payload(f'iter{iteration}', i) for i, n in enumerate(top + nested)}
+            for name, data in content.items():
+                write_chunked(f'/{name}', data)
+            if iteration < 2:
+                # Tear down between iterations.
+                for n in nested:
+                    assert alpha.unlink(f'/{n}') == 0
+                assert alpha.rmdir('/stashfs/__pycache__') == 0
+                for n in top:
+                    assert alpha.unlink(f'/{n}') == 0
+                assert alpha.rmdir('/stashfs') == 0
+
+        final_content = content  # last iteration's contents
+
+        multi_stash.unmount_all()
+        old_size = multi_stash.path.stat().st_size
+        report = optimize(multi_stash.path, [], kdf=fast_kdf)
+        new_size = multi_stash.path.stat().st_size
+        assert report.reclaimed == old_size - new_size
+
+        reopened = multi_stash.mount('alpha')
+        for name, expected in final_content.items():
+            got = reopened.read(f'/{name}', len(expected), 0)
+            assert got == expected, f'content mismatch for {name}'
+
+    def test_cp_rmrf_cp_optimize_keeps_files_readable(self, multi_stash, fast_kdf):
+        """User workflow: ``cp -r dir && rm -rf dir && cp -r dir && optimize``.
+
+        After optimize, every file must still read back under its
+        password. The reported bug produced ``-EIO`` on every read
+        because the re-created files pointed at chunks that had been
+        mis-reclaimed.
+
+        The tree mirrors the user's real scenario: nested ``__pycache__``
+        subdir, multi-chunk files, a dozen top-level entries.
+        """
+        alpha = multi_stash.mount('alpha')
+
+        top = [f'stashfs/{n}' for n in ['allocation.py', 'cli.py', 'container.py', 'volume.py']]
+        nested = [f'stashfs/__pycache__/{n}' for n in ['allocation.pyc', 'cli.pyc', 'container.pyc']]
+
+        def payload(tag: str, i: int, size: int) -> bytes:
+            base = f'{tag}-{i}-'.encode()
+            return (base * (size // len(base) + 1))[:size]
+
+        v1 = {name: payload('v1', i, 12_000) for i, name in enumerate(top + nested)}
+        v2 = {name: payload('v2', i, 18_000) for i, name in enumerate(top + nested)}
+
+        # --- round 1: mkdir tree + write files ---
+        assert alpha.mkdir('/stashfs', 0o755) == 0
+        assert alpha.mkdir('/stashfs/__pycache__', 0o755) == 0
+        for name, data in v1.items():
+            assert alpha.mknod(f'/{name}', 0o644, 0) == 0
+            assert alpha.write(f'/{name}', data, 0) == len(data)
+
+        # --- rm -rf (depth-first: inner files, inner dir, outer files, outer dir) ---
+        for name in nested:
+            assert alpha.unlink(f'/{name}') == 0
+        assert alpha.rmdir('/stashfs/__pycache__') == 0
+        for name in top:
+            assert alpha.unlink(f'/{name}') == 0
+        assert alpha.rmdir('/stashfs') == 0
+
+        # --- round 2: recreate tree with new content ---
+        assert alpha.mkdir('/stashfs', 0o755) == 0
+        assert alpha.mkdir('/stashfs/__pycache__', 0o755) == 0
+        for name, data in v2.items():
+            assert alpha.mknod(f'/{name}', 0o644, 0) == 0
+            assert alpha.write(f'/{name}', data, 0) == len(data)
+
+        # --- unmount, optimize without password, remount ---
+        multi_stash.unmount_all()
+        old_size = multi_stash.path.stat().st_size
+        report = optimize(multi_stash.path, [], kdf=fast_kdf)
+        new_size = multi_stash.path.stat().st_size
+        assert report.reclaimed == old_size - new_size
+        assert new_size < old_size
+
+        reopened = multi_stash.mount('alpha')
+        for name, expected in v2.items():
+            got = reopened.read(f'/{name}', len(expected), 0)
+            assert got == expected, f'content mismatch for {name}'
+
+
 class TestOptimizeWithDirectories:
     """`optimize` must keep shrinking the file when directories churn too."""
 

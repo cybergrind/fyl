@@ -8,6 +8,7 @@ higher layers.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import struct
@@ -42,6 +43,14 @@ class Storage(Protocol):
 class FileWrapper:
     """Plaintext file-backed ``Storage`` implementation.
 
+    Acquires a shared advisory ``flock`` on the backing file for its
+    entire lifetime. This is how ``stashfs optimize`` detects that the
+    backing file is still in use by a mount — optimize grabs
+    ``LOCK_EX | LOCK_NB`` and bails if any mount is holding the shared
+    lock. Without this check, running optimize on a live mount would
+    silently leave the FUSE process with stale chunk offsets that point
+    past the newly-compacted file, producing ``-EIO`` on every read.
+
     The extra legacy helpers (``read_meta_offset``, ``remove_data``,
     ``truncate_last``, ``reset_handlers``) exist to keep the historical
     byte-offset filesystem working during the transition; they are not
@@ -58,6 +67,15 @@ class FileWrapper:
         self.reset_handlers()
         self.inner_files: set[str] = set()
 
+    def _acquire_shared_lock(self, handle) -> None:
+        """Advisory LOCK_SH. Tolerates unsupported filesystems (tmpfs, NFS)."""
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            # flock not supported or blocked — fall through; the safety
+            # check in ``optimize`` will simply have nothing to grip.
+            log.debug('flock(LOCK_SH) unavailable on %s', self.path)
+
     def read_meta_offset(self) -> int:
         """Legacy: check MAGIC_BYTES near EOF, return meta offset or -1."""
         self.read_handle.seek(-len(self.MAGIC_BYTES) - 8, os.SEEK_END)
@@ -69,6 +87,7 @@ class FileWrapper:
         if hasattr(self, 'read_handle'):
             self.read_handle.close()
         self.read_handle = self.path.open('rb')
+        self._acquire_shared_lock(self.read_handle)
 
     def remove_data(self, offset: int, size: int) -> None:
         """Legacy: drop ``size`` bytes starting at ``offset``, in place."""

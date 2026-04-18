@@ -13,8 +13,11 @@ anywhere before the rename leaves the original untouched.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +44,41 @@ class OptimizeError(Exception):
     """Raised when optimize refuses to run (live mount, locked + drop-locked disagreement, ...)."""
 
 
+@contextmanager
+def _hold_exclusive_lock(path: Path) -> Iterator[None]:
+    """Take an exclusive advisory lock on the backing file.
+
+    Guards against running optimize while a live FUSE mount still
+    holds the file open. The mount's ``FileWrapper`` acquires a
+    shared lock for its lifetime; this exclusive lock will block if
+    any mount is alive, and we raise ``OptimizeError`` rather than
+    proceed with stale-offset corruption.
+
+    If ``flock`` is unsupported on the filesystem (some network FSes),
+    the call is skipped — we prefer graceful degradation to a hard
+    refusal on an otherwise-safe workflow.
+    """
+    fh = path.open('rb')
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise OptimizeError(f'{path} is in use by another process (likely a live mount); unmount first') from exc
+        except OSError as exc:
+            if exc.errno in (11, 35):  # EAGAIN / EWOULDBLOCK on BSD
+                raise OptimizeError(
+                    f'{path} is in use by another process (likely a live mount); unmount first'
+                ) from exc
+            # flock unsupported — proceed without the guard.
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 def optimize(
     path: Path,
     passwords: Sequence[str] = (),
@@ -64,6 +102,18 @@ def optimize(
 
     old_size = path.stat().st_size
 
+    with _hold_exclusive_lock(path):
+        return _optimize_locked(path, passwords, kdf=kdf, drop_locked=drop_locked, old_size=old_size)
+
+
+def _optimize_locked(
+    path: Path,
+    passwords: Sequence[str],
+    *,
+    kdf: KDF,
+    drop_locked: bool,
+    old_size: int,
+) -> OptimizeReport:
     src_fw = FileWrapper(path)
     src_cover = CoverStorage.attach(src_fw)
     src_container = Container(src_cover)
