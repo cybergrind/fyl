@@ -147,34 +147,45 @@ class TestOptimizeMultiVolume:
                 assert _sha(got) == want_hash, f'{pw!r}:{name}'
 
 
-class TestOptimizeErrors:
-    def test_refuses_locked_slot(self, multi_stash, fast_kdf):
+class TestOptimizePasswordless:
+    def test_preserves_locked_slot_without_password(self, multi_stash, fast_kdf):
+        """Optimize must never need a password; locked slots pass through."""
         alpha = multi_stash.mount('alpha')
         assert alpha.write('/secret', b'hello', 0) == 5
         multi_stash.unmount_all()
 
-        before = multi_stash.path.read_bytes()
-        with pytest.raises(OptimizeError):
-            optimize(multi_stash.path, [''], kdf=fast_kdf)
-        assert multi_stash.path.read_bytes() == before
+        # No passwords supplied and not drop_locked: optimize succeeds
+        # without touching slot 1's wrap.
+        report = optimize(multi_stash.path, [], kdf=fast_kdf)
+        assert report.dropped_slots == []
+        assert report.rebuilt_slots == [1]
 
-    def test_drop_locked_purges(self, multi_stash, fast_kdf):
+        # Remount under 'alpha' and the file still reads back.
+        reopened = multi_stash.mount('alpha')
+        assert reopened.read('/secret', 5, 0) == b'hello'
+
+    def test_drop_locked_frees_unreachable_slot(self, multi_stash, fast_kdf):
         empty = multi_stash.mount('')
         assert empty.write('/pub', b'public', 0) == 6
         alpha = multi_stash.mount('alpha')
         assert alpha.write('/secret', b'alpha-data', 0) == 10
         multi_stash.unmount_all()
 
+        # Only the empty-password is supplied; slot 1 (alpha) is locked
+        # and drop_locked is on.
         report = optimize(multi_stash.path, [''], kdf=fast_kdf, drop_locked=True)
         assert report.dropped_slots == [1]
-        assert report.rebuilt_slots == [0]
+        assert 0 in report.rebuilt_slots
+        assert 1 not in report.rebuilt_slots
 
         empty_ro = multi_stash.mount('')
         assert empty_ro.read('/pub', 6, 0) == b'public'
-        # Slot 1 is free -> mounting "alpha" creates a fresh, empty volume.
+        # Slot 1 is free -> mounting 'alpha' creates a fresh empty volume.
         alpha_ro = multi_stash.mount('alpha')
         assert alpha_ro.volume.list() == []
 
+
+class TestOptimizeErrors:
     def test_refuses_live_mount(self, multi_stash, fast_kdf, monkeypatch):
         alpha = multi_stash.mount('alpha')
         assert alpha.write('/f', b'x', 0) == 1
@@ -194,18 +205,21 @@ class TestOptimizeErrors:
 
         before = multi_stash.path.read_bytes()
 
-        from stashfs import Container
+        # Inject a failure mid-rebuild by breaking Allocation.append,
+        # which is what optimize now calls for each live chunk it
+        # copies into the destination.
+        from stashfs.allocation import Allocation
 
         call_count = {'n': 0}
-        original = Container.append_chunk
+        original = Allocation.append
 
         def flaky(self, frame):
             call_count['n'] += 1
-            if call_count['n'] == 3:
+            if call_count['n'] == 4:
                 raise OSError('simulated write error')
             return original(self, frame)
 
-        monkeypatch.setattr(Container, 'append_chunk', flaky)
+        monkeypatch.setattr(Allocation, 'append', flaky)
 
         with pytest.raises(OSError, match='simulated write error'):
             optimize(multi_stash.path, ['alpha'], kdf=fast_kdf)

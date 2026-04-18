@@ -352,7 +352,54 @@ class TestCrashSafety:
         assert v2.read_file('a', 0, 100) == b'initial'
 
 
-class TestDataOnDiskLooksRandom:
+class TestMarkDeadAtCommit:
+    """Volume must mark superseded chunks dead in the container's allocation.
+
+    Without this, the backing file grows forever across rewrites even
+    though logically only the current data + current index chain is
+    needed. The allocation table is plaintext, so ``optimize`` can then
+    reclaim these chunks without any password.
+    """
+
+    def test_repeated_overwrite_stays_at_baseline_live_count(self, container, kdf):
+        """Rewriting the same file N times must not grow the live-chunk count."""
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('f', 0, b'first')
+        baseline = container.num_chunks()
+        for i in range(10):
+            v.write_file('f', 0, f'round-{i}'.encode())
+        # Same file, same logical layout -> same live-chunk count.
+        assert container.num_chunks() == baseline
+
+    def test_truncate_marks_dropped_chunks_dead(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        # 3 chunks of data.
+        v.write_file('f', 0, b'x' * (CHUNK_PAYLOAD_SIZE * 3))
+        before = container.num_chunks()
+        # Drop to 1 chunk worth; two chunks' worth of data must die.
+        v.truncate('f', CHUNK_PAYLOAD_SIZE)
+        after = container.num_chunks()
+        assert after < before
+        # File still reads back correctly.
+        assert v.read_file('f', 0, CHUNK_PAYLOAD_SIZE) == b'x' * CHUNK_PAYLOAD_SIZE
+
+    def test_unlink_last_file_drops_live_count_to_zero(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('f', 0, b'payload' * 1000)
+        assert container.num_chunks() > 0
+        v.unlink('f')
+        assert container.num_chunks() == 0
+
+    def test_unlink_of_one_file_keeps_other_alive(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('keeper', 0, b'keepme')
+        v.write_file('victim', 0, b'x' * (CHUNK_PAYLOAD_SIZE * 2))
+        baseline = container.num_chunks()
+        v.unlink('victim')
+        # Victim's 2 data chunks + at least the old index chain chunks are dead.
+        assert container.num_chunks() < baseline
+        assert v.read_file('keeper', 0, 6) == b'keepme'
+
     def test_plaintext_not_in_container(self, container, kdf):
         Volume(container, kdf, 'alpha').write_file('note', 0, b'secret-payload-xyz')
         disk_bytes = container.storage.read(container.storage.size(), 0)

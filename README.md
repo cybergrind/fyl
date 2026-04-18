@@ -30,10 +30,13 @@ Unmount with `fusermount -u <mountpoint>`; `stashfs` also auto-unmounts
 after `--ttl` seconds of idleness (default 300).
 
 Every mutation appends fresh chunks (append-only layer for crash
-safety) and never reclaims superseded ones, so the backing file
-monotonically grows. `stashfs optimize` rebuilds the file with only the
-live chunks of every unlocked slot; it must not be run while the file
-is mounted.
+safety) and marks the superseded ones DEAD in a plaintext allocation
+table. `stashfs optimize` reads that table and rebuilds the file
+with only the live chunks — **no password required**, even when the
+container holds multiple password-protected volumes. Locked slots
+pass through untouched (with their own marked-dead chunks reclaimed);
+pass `--drop-locked` to purge a slot whose password is unknown. Must
+not be run while the file is mounted.
 
 ## Security model
 
@@ -48,8 +51,16 @@ is mounted.
   an attacker can observe how many volumes the container holds. This is
   deliberate; it makes "pick the first free slot" easy and avoids
   VeraCrypt-grade steganography tricks.
-* **Not a production secrets store.** Compaction is available only
-  offline via `stashfs optimize`; no protection against physical memory
+* **Allocation table leak.** Chunk metadata lives in a plaintext
+  allocation table (see `stashfs/allocation.py`): a `STSHALOC`-magic
+  chain at the head of the chunk area with one `u32` entry per logical
+  chunk (`DEAD` or live-physical-slot). This lets `stashfs optimize`
+  reclaim dead chunks **without any password**. An observer of the
+  backing file can therefore see, over time, the liveness of every
+  chunk and the total live/dead counts. They **cannot** see which slot
+  owns which chunk — slot membership stays inside the AEAD envelope.
+* **Not a production secrets store.** Compaction is available offline
+  via `stashfs optimize`; no protection against physical memory
   inspection, no multi-user keying.
 
 ## Development

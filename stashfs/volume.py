@@ -39,21 +39,28 @@ INDEX_HEADER_SIZE = len(INDEX_MAGIC) + 8
 INDEX_PAYLOAD_SIZE = CHUNK_PAYLOAD_SIZE - INDEX_HEADER_SIZE
 INDEX_CHAIN_END = 0xFFFF_FFFF_FFFF_FFFF
 
+# Type alias so pyrefly doesn't confuse the builtin ``list`` with the
+# ``Volume.list`` method when evaluating annotations inside the class.
+_ChunkIds = list[int]
 
-def write_index_chain(container: Container, cipher: AEADChunk, blob: bytes) -> int:
+
+def write_index_chain(container: Container, cipher: AEADChunk, blob: bytes) -> tuple[int, list[int]]:
     """Append the serialised index as a chain of versioned chunks.
 
     Each chunk's plaintext is ``INDEX_MAGIC || next_cid || page ||
     zero_pad`` filling the full chunk payload. Pages are appended in
     reverse so every non-tail chunk already knows its successor's id
-    by the time it is sealed. Returns the *head* chunk id (what the
-    slot should point at).
+    by the time it is sealed. Returns ``(head_chunk_id, chain_ids)``:
+    the head (what the slot should point at) and the full list of
+    chunk ids comprising the chain in order from head to tail, so the
+    caller can later mark them dead when the chain is superseded.
     """
     if blob == b'':
         pages: list[bytes] = [b'']
     else:
         pages = [blob[i : i + INDEX_PAYLOAD_SIZE] for i in range(0, len(blob), INDEX_PAYLOAD_SIZE)]
     next_cid = INDEX_CHAIN_END
+    reverse_chain: list[int] = []
     for page in reversed(pages):
         padded_page = page + b'\x00' * (INDEX_PAYLOAD_SIZE - len(page))
         assert len(padded_page) == INDEX_PAYLOAD_SIZE
@@ -61,7 +68,9 @@ def write_index_chain(container: Container, cipher: AEADChunk, blob: bytes) -> i
         assert len(plaintext) == CHUNK_PAYLOAD_SIZE
         frame = cipher.seal(plaintext)
         next_cid = container.append_chunk(frame)
-    return next_cid
+        reverse_chain.append(next_cid)
+    chain_ids = list(reversed(reverse_chain))
+    return next_cid, chain_ids
 
 
 class Volume:
@@ -83,6 +92,10 @@ class Volume:
         self._slot = self.slot_table.find_or_create()
         self._cipher = AEADChunk(self._slot.volume_key)
         self._files: dict[str, VolumeFile] = {}
+        # The chunk ids making up the currently-live file-index chain.
+        # We remember them so we can mark-dead the chain when it's
+        # superseded on the next commit.
+        self._index_chain_ids: list[int] = []
         if self._slot.file_table_chunk_id is not None:
             self._load_file_index()
 
@@ -138,6 +151,7 @@ class Volume:
         while len(file.chunk_ids) <= last_needed_chunk:
             file.chunk_ids.append(self._append_plaintext(b'\x00' * pt))
 
+        superseded: list[int] = []
         if buf:
             first_chunk = offset // pt
             last_chunk = (end - 1) // pt
@@ -153,10 +167,18 @@ class Volume:
                 dst_start = write_start - chunk_start
                 dst_end = write_end - chunk_start
                 current[dst_start:dst_end] = buf[src_start:src_end]
+                superseded.append(file.chunk_ids[chunk_idx])
                 file.chunk_ids[chunk_idx] = self._append_plaintext(bytes(current))
 
         file.size = max(file.size, end)
         self._persist_file_index()
+        # Mark superseded chunks dead only after the slot wrap commit.
+        # A crash between the append and this point leaves the old
+        # chunks marked live; optimize will miss them but data
+        # integrity is preserved (the old slot points at the old chain
+        # which still references the old chunks).
+        for cid in superseded:
+            self.container.mark_chunk_dead(cid)
         return len(buf)
 
     def truncate(self, name: str, size: int) -> None:
@@ -168,13 +190,18 @@ class Volume:
         pt = CHUNK_PAYLOAD_SIZE
 
         if size == 0:
+            dropped = list(file.chunk_ids)
             file.chunk_ids = []
             file.size = 0
             self._persist_file_index()
+            for cid in dropped:
+                self.container.mark_chunk_dead(cid)
             return
 
         needed_chunks = (size + pt - 1) // pt
+        dropped: list[int] = []
         if needed_chunks < len(file.chunk_ids):
+            dropped = file.chunk_ids[needed_chunks:]
             file.chunk_ids = file.chunk_ids[:needed_chunks]
         while len(file.chunk_ids) < needed_chunks:
             file.chunk_ids.append(self._append_plaintext(b'\x00' * pt))
@@ -189,9 +216,12 @@ class Volume:
             for i in range(tail_end, pt):
                 current[i] = 0
             file.chunk_ids[-1] = self._append_plaintext(bytes(current))
+            self.container.mark_chunk_dead(last_cid)
 
         file.size = size
         self._persist_file_index()
+        for cid in dropped:
+            self.container.mark_chunk_dead(cid)
 
     def rename(self, old: str, new: str) -> None:
         """Rename ``old`` to ``new`` within this volume.
@@ -215,10 +245,18 @@ class Volume:
     def unlink(self, name: str) -> None:
         if name not in self._files:
             raise KeyError(name)
-        del self._files[name]
+        victim = self._files.pop(name)
         if not self._files:
             if self.is_associated:
                 self.slot_table.free(self._slot.index)
+                # Every chunk this volume ever wrote under the old key
+                # is now unreachable (we're about to rotate the key).
+                # Mark them all dead so optimize can reclaim them.
+                for cid in victim.chunk_ids:
+                    self.container.mark_chunk_dead(cid)
+                for cid in self._index_chain_ids:
+                    self.container.mark_chunk_dead(cid)
+                self._index_chain_ids = []
                 self._slot = SlotInfo(
                     index=self._slot.index,
                     volume_key=os.urandom(len(self._slot.volume_key)),
@@ -231,27 +269,35 @@ class Volume:
                 self._cipher = AEADChunk(self._slot.volume_key)
         else:
             self._persist_file_index()
+            for cid in victim.chunk_ids:
+                self.container.mark_chunk_dead(cid)
 
     def _load_file_index(self) -> None:
         assert self._slot.file_table_chunk_id is not None
-        blob = self._read_index_chain(self._slot.file_table_chunk_id)
+        blob, chain_ids = self._read_index_chain(self._slot.file_table_chunk_id)
         self._files = parse(blob)
+        self._index_chain_ids = chain_ids
 
-    def _read_index_chain(self, head_chunk_id: int) -> bytes:
+    def _read_index_chain(self, head_chunk_id: int) -> tuple[bytes, _ChunkIds]:
         """Walk the ``next``-pointer chain starting at ``head_chunk_id``.
 
         Auto-detects the legacy single-chunk index format: a chunk whose
         plaintext does *not* start with ``INDEX_MAGIC`` is treated as a
         zero-padded serialised blob with no chain pointer. This lets
         containers written before the chained-index change still open.
+
+        Returns ``(blob, chain_ids)`` — the concatenated payload and the
+        list of chunk ids walked (head first).
         """
         out = bytearray()
+        chain_ids: list[int] = []
         cid = head_chunk_id
         seen: set[int] = set()
         while cid != INDEX_CHAIN_END:
             if cid in seen:
                 raise VolumeCorrupt(f'file index chain cycle at chunk {cid}')
             seen.add(cid)
+            chain_ids.append(cid)
             plaintext = self._decrypt_chunk(cid)
             if plaintext[: len(INDEX_MAGIC)] == INDEX_MAGIC:
                 (next_cid,) = struct.unpack('>Q', plaintext[len(INDEX_MAGIC) : INDEX_HEADER_SIZE])
@@ -263,31 +309,40 @@ class Volume:
                 # (zero-padded). No chain, stop after this chunk.
                 out.extend(plaintext)
                 break
-        return bytes(out)
+        return bytes(out), chain_ids
 
     def _persist_file_index(self) -> None:
         blob = serialize(self._files)
-        new_chunk_id = self._write_index_chain(blob)
+        new_head_id, new_chain_ids = write_index_chain(self.container, self._cipher, blob)
         if self._slot.file_table_chunk_id is None:
             slot_index = self._reserve_slot_for_associate()
-            self.slot_table.associate(slot_index, self._slot.volume_key, new_chunk_id)
+            self.slot_table.associate(slot_index, self._slot.volume_key, new_head_id)
             self._slot = SlotInfo(
                 index=slot_index,
                 volume_key=self._slot.volume_key,
-                file_table_chunk_id=new_chunk_id,
+                file_table_chunk_id=new_head_id,
                 is_new=False,
             )
         else:
-            self.slot_table.update(self._slot.index, self._slot.volume_key, new_chunk_id)
+            self.slot_table.update(self._slot.index, self._slot.volume_key, new_head_id)
             self._slot = SlotInfo(
                 index=self._slot.index,
                 volume_key=self._slot.volume_key,
-                file_table_chunk_id=new_chunk_id,
+                file_table_chunk_id=new_head_id,
                 is_new=False,
             )
+        # Mark the previous chain dead only after the slot wrap now
+        # points at the new chain. A crash before this mark-dead step
+        # leaves state consistent (optimize will just miss these
+        # orphans until some future commit re-marks them).
+        previous_chain = self._index_chain_ids
+        self._index_chain_ids = new_chain_ids
+        for cid in previous_chain:
+            self.container.mark_chunk_dead(cid)
 
     def _write_index_chain(self, blob: bytes) -> int:
-        return write_index_chain(self.container, self._cipher, blob)
+        head_id, _chain = write_index_chain(self.container, self._cipher, blob)
+        return head_id
 
     def _reserve_slot_for_associate(self) -> int:
         """Return the slot index to associate on the first commit.

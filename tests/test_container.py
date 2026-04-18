@@ -30,10 +30,11 @@ def _frame(fill: int = 0) -> bytes:
 
 
 class TestContainerInitialisation:
-    def test_fresh_container_writes_header_and_slot_table(self, tmp_path):
+    def test_fresh_container_writes_header_slot_table_and_first_alloc_chunk(self, tmp_path):
         path = tmp_path / 'backing'
         Container(FileWrapper(path))
-        assert path.stat().st_size == DATA_START
+        # header + slot_table + one alloc chunk.
+        assert path.stat().st_size == DATA_START + CHUNK_FRAME_SIZE
 
     def test_fresh_container_starts_with_zero_chunks(self, container):
         assert container.num_chunks() == 0
@@ -70,46 +71,80 @@ class TestContainerInitialisation:
         with pytest.raises(ContainerCorrupt):
             Container(FileWrapper(path))
 
+    def test_unknown_format_version_rejected(self, tmp_path):
+        """A container with format_version != 2 must refuse to open."""
+        import struct
+
+        from stashfs.container import FORMAT_VERSION
+
+        path = tmp_path / 'backing'
+        # Fresh container, then corrupt the version byte.
+        Container(FileWrapper(path))
+        blob = bytearray(path.read_bytes())
+        struct.pack_into('>I', blob, 16, FORMAT_VERSION + 99)
+        path.write_bytes(bytes(blob))
+        with pytest.raises(ContainerCorrupt, match='format version'):
+            Container(FileWrapper(path))
+
 
 class TestLayoutConstants:
     def test_sizes_match_plan(self):
-        assert HEADER_SIZE == 16
+        assert HEADER_SIZE == 32
         assert SLOT_SIZE == 80
         assert N_SLOTS == 8
         assert SLOT_TABLE_SIZE == 640
-        assert DATA_START == 656
+        assert DATA_START == 672
         assert CHUNK_FRAME_SIZE == 4124
+
+    def test_format_version_is_two(self):
+        from stashfs.container import FORMAT_VERSION
+
+        assert FORMAT_VERSION == 2
 
 
 class TestChunks:
-    def test_append_returns_monotonic_ids(self, container):
+    def test_append_returns_monotonic_logical_ids(self, container):
+        """``append_chunk`` now returns a stable logical id, not a physical slot."""
         assert container.append_chunk(_frame(1)) == 0
         assert container.append_chunk(_frame(2)) == 1
         assert container.append_chunk(_frame(3)) == 2
         assert container.num_chunks() == 3
 
     def test_round_trip(self, container):
-        idx = container.append_chunk(_frame(0xAB))
-        assert container.read_chunk(idx) == _frame(0xAB)
-
-    def test_write_chunk_overwrites(self, container):
-        idx = container.append_chunk(_frame(0xAB))
-        container.write_chunk(idx, _frame(0xCD))
-        assert container.read_chunk(idx) == _frame(0xCD)
-
-    def test_write_chunk_out_of_range_raises(self, container):
-        container.append_chunk(_frame(0))
-        with pytest.raises(IndexError):
-            container.write_chunk(5, _frame(0))
+        lid = container.append_chunk(_frame(0xAB))
+        assert container.read_chunk(lid) == _frame(0xAB)
 
     def test_read_chunk_out_of_range_raises(self, container):
-        with pytest.raises(IndexError):
+        with pytest.raises(KeyError):
             container.read_chunk(0)
 
+    def test_read_dead_chunk_raises(self, container):
+        lid = container.append_chunk(_frame(0xAB))
+        container.mark_chunk_dead(lid)
+        with pytest.raises(KeyError):
+            container.read_chunk(lid)
+
+    def test_mark_chunk_dead_shrinks_live_count(self, container):
+        ids = [container.append_chunk(_frame(i)) for i in range(3)]
+        container.mark_chunk_dead(ids[1])
+        assert container.num_chunks() == 2
+        # Other chunks are still readable by their logical id.
+        assert container.read_chunk(ids[0]) == _frame(0)
+        assert container.read_chunk(ids[2]) == _frame(2)
+
+    def test_logical_ids_stable_after_sibling_dies(self, container):
+        """Logical ids never shift when a neighbour is marked dead."""
+        a = container.append_chunk(_frame(0xAA))
+        b = container.append_chunk(_frame(0xBB))
+        c = container.append_chunk(_frame(0xCC))
+        container.mark_chunk_dead(b)
+        assert container.read_chunk(a) == _frame(0xAA)
+        assert container.read_chunk(c) == _frame(0xCC)
+
     def test_wrong_frame_size_rejected(self, container):
-        with pytest.raises(ValueError, match='chunk frame'):
+        with pytest.raises(ValueError, match='frame must be'):
             container.append_chunk(b'\x00' * 10)
-        with pytest.raises(ValueError, match='chunk frame'):
+        with pytest.raises(ValueError, match='frame must be'):
             container.append_chunk(b'\x00' * (CHUNK_FRAME_SIZE + 1))
 
 
@@ -157,10 +192,17 @@ class TestSlots:
 
 
 class TestHeader:
+    """``read_header`` / ``write_header`` expose only the 16 B salt portion.
+
+    The format-version and alloc-head-offset fields are Container-private
+    bookkeeping and are not exposed to callers.
+    """
+
     def test_header_round_trip(self, container):
-        container.write_header(b'\x01' * HEADER_SIZE)
-        assert container.read_header() == b'\x01' * HEADER_SIZE
+        salt = b'\x01' * 16
+        container.write_header(salt)
+        assert container.read_header() == salt
 
     def test_header_size_enforced(self, container):
         with pytest.raises(ValueError, match='header must be'):
-            container.write_header(b'\x00' * (HEADER_SIZE - 1))
+            container.write_header(b'\x00' * 15)

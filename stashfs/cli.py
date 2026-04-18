@@ -111,18 +111,18 @@ def _run_optimize(args: argparse.Namespace) -> int:
         return 1
 
     passwords = list(args.password)
-    if not passwords:
-        # Interactive: prompt once for each likely slot. Users can press
-        # enter to stop adding passwords (empty string is always a
-        # valid slot-0 password).
+    # Only prompt when --drop-locked is set: the user has opted in to a
+    # destructive action and must distinguish "truly locked" from "I
+    # just forgot to pass --password". Without --drop-locked, optimize
+    # is non-destructive and needs no password at all — locked slots
+    # pass through untouched.
+    if args.drop_locked and not passwords:
         while True:
             pw = getpass.getpass('Password (enter on empty line to finish): ')
             if pw == '' and passwords:
                 break
             passwords.append(pw)
             if pw == '':
-                # The user entered empty as their FIRST password; treat
-                # that as "try empty-slot only".
                 break
 
     try:

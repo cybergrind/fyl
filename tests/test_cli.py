@@ -31,6 +31,45 @@ class TestCLIParser:
         assert reopened.read('/f', 5, 0) == b'hello'
 
 
+class TestOptimizeCLIPasswordless:
+    """``stashfs optimize <file>`` must not prompt for any password.
+
+    Password-free optimize is the whole point of the allocation-layer
+    change; the CLI is the user-visible surface of that promise.
+    """
+
+    def test_no_prompt_on_fresh_cover(self, tmp_path, fast_kdf, monkeypatch):
+        cover = tmp_path / 'cover.png'
+        cover.write_bytes(b'\x89PNG\r\n\x1a\n' + b'cover-bytes-' * 40)
+
+        def must_not_prompt(_msg=''):
+            raise AssertionError('getpass must not be called under plain optimize')
+
+        monkeypatch.setattr('stashfs.cli.getpass.getpass', must_not_prompt)
+        monkeypatch.setattr('stashfs.cli._build_kdf', lambda _args: fast_kdf)
+
+        rc = main(['optimize', str(cover)])
+        assert rc == 0
+
+    def test_no_prompt_on_populated_file(self, multi_stash, fast_kdf, monkeypatch):
+        alpha = multi_stash.mount('alpha')
+        assert alpha.write('/f', b'hello', 0) == 5
+        multi_stash.unmount_all()
+
+        def must_not_prompt(_msg=''):
+            raise AssertionError('getpass must not be called under plain optimize')
+
+        monkeypatch.setattr('stashfs.cli.getpass.getpass', must_not_prompt)
+        monkeypatch.setattr('stashfs.cli._build_kdf', lambda _args: fast_kdf)
+
+        rc = main(['optimize', str(multi_stash.path)])
+        assert rc == 0
+
+        # File still readable under its password.
+        reopened = multi_stash.mount('alpha')
+        assert reopened.read('/f', 5, 0) == b'hello'
+
+
 class TestImplicitMount:
     """`stash <existing-file>` should behave like `stash mount <existing-file>`.
 
