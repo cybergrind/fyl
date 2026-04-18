@@ -1,4 +1,4 @@
-"""Unit tests for ``fly.container.Container``.
+"""Unit tests for ``fyl.container.Container``.
 
 Container is pure byte accounting - no crypto here.
 """
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from fly.container import (
+from fyl.container import (
     CHUNK_FRAME_SIZE,
     DATA_START,
     HEADER_SIZE,
@@ -17,7 +17,7 @@ from fly.container import (
     Container,
     ContainerCorrupt,
 )
-from fly.storage import FileWrapper
+from fyl.storage import FileWrapper
 
 
 @pytest.fixture

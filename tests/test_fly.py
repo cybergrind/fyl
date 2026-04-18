@@ -10,9 +10,9 @@ import errno
 
 import pytest
 
-from fly import KDF, FileRecord, FileStructure, FileWrapper, Fly, KDFParams
-from fly.fuse_app import _ensure_mountpoint, _looks_like_fuse_mount, _unmount_stale
-from fly.volume import Volume
+from fyl import KDF, FileRecord, FileStructure, FileWrapper, Fly, KDFParams
+from fyl.fuse_app import _ensure_mountpoint, _looks_like_fuse_mount, _unmount_stale
+from fyl.volume import Volume
 from tests.conftest import FakeArgs
 
 
@@ -379,7 +379,7 @@ class TestLooksLikeFuseMount:
         mp.mkdir()
         mounts = self._make_mounts(
             tmp_path,
-            [f'fly.py {mp} fuse.fly.py rw,nosuid,nodev 0 0'],
+            [f'fyl.py {mp} fuse.fyl.py rw,nosuid,nodev 0 0'],
         )
         assert _looks_like_fuse_mount(mp, mounts_path=str(mounts)) is True
 
@@ -424,7 +424,7 @@ class TestUnmountStale:
 
             return R()
 
-        monkeypatch.setattr('fly.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: False)
+        monkeypatch.setattr('fyl.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: False)
         _unmount_stale(tmp_path / 'mnt', runner=fake_runner)
         assert calls == []
 
@@ -442,7 +442,7 @@ class TestUnmountStale:
 
             return R()
 
-        monkeypatch.setattr('fly.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: True)
+        monkeypatch.setattr('fyl.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: True)
         _unmount_stale(mp, runner=fake_runner)
         assert calls == [['fusermount', '-u', str(mp)]]
 
@@ -450,7 +450,7 @@ class TestUnmountStale:
         def fake_runner(argv, **kw):
             raise FileNotFoundError('fusermount not installed')
 
-        monkeypatch.setattr('fly.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: True)
+        monkeypatch.setattr('fyl.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: True)
         # Must not raise - we prefer to surface the original FUSE error
         # downstream rather than a cleanup failure.
         _unmount_stale(tmp_path / 'mnt', runner=fake_runner)

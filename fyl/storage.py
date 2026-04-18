@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
-log = logging.getLogger('fly.storage')
+log = logging.getLogger('fyl.storage')
 
 
 @runtime_checkable
@@ -122,11 +122,11 @@ class FileWrapper:
 
 
 class CoverStorage:
-    """``Storage`` view that hides a fly container inside an existing file.
+    """``Storage`` view that hides a fyl container inside an existing file.
 
     Physical layout on the inner storage::
 
-        [cover bytes][fly container][FOOTER_MAGIC 8B][cover_length u64 8B]
+        [cover bytes][fyl container][FOOTER_MAGIC 8B][cover_length u64 8B]
 
     ``Container`` sits on top of this view and sees only the middle part
     as its backing, starting at offset 0. That makes cover support

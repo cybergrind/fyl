@@ -1,18 +1,22 @@
-# fly
+# fyl
 
 A tiny FUSE filesystem that stores its entire contents, encrypted, inside a
 single regular file. One backing file can host up to **8 independent
 volumes** -- one "no password" slot plus up to seven password-protected
 slots -- each with its own private file listing.
 
+(Previously named `fly`; renamed because `fly` is taken on PyPI. The
+on-disk format is unchanged.)
+
 ## Usage
 
 ```bash
-uv sync                                   # install dependencies
-uv run python -m fly.fuse_app <backing> [mountpoint] [--ttl SECONDS] [--debug]
+uv sync                                          # install dependencies
+uv run fyl mount <backing> [mountpoint] [--ttl SECONDS] [--debug]
+uv run fyl optimize <backing>                    # reclaim space
 ```
 
-On mount `fly` prompts for a password via `getpass`. The empty string is
+On mount `fyl` prompts for a password via `getpass`. The empty string is
 a real, stable password that always maps to slot 0; any non-empty
 password either unlocks its existing slot (slots 1..7) or grabs the
 first free slot to start a new volume. A slot only becomes "occupied"
@@ -21,8 +25,14 @@ is removed. If every password slot is occupied and the provided
 password matches none of them, the mount fails with
 `password does not match`.
 
-Unmount with `fusermount -u <mountpoint>`; `fly` also auto-unmounts after
+Unmount with `fusermount -u <mountpoint>`; `fyl` also auto-unmounts after
 `--ttl` seconds of idleness (default 300).
+
+Every mutation appends fresh chunks (append-only layer for crash
+safety) and never reclaims superseded ones, so the backing file
+monotonically grows. `fyl optimize` rebuilds the file with only the
+live chunks of every unlocked slot; it must not be run while the file
+is mounted.
 
 ## Security model
 
@@ -37,8 +47,9 @@ Unmount with `fusermount -u <mountpoint>`; `fly` also auto-unmounts after
   an attacker can observe how many volumes the container holds. This is
   deliberate; it makes "pick the first free slot" easy and avoids
   VeraCrypt-grade steganography tricks.
-* **Not a production secrets store.** No compaction of dead chunks, no
-  protection against physical memory inspection, no multi-user keying.
+* **Not a production secrets store.** Compaction is available only
+  offline via `fyl optimize`; no protection against physical memory
+  inspection, no multi-user keying.
 
 ## Development
 

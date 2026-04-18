@@ -17,8 +17,8 @@ import errno
 import hashlib
 import random
 
-from fly import Fly
-from fly.container import CHUNK_PAYLOAD_SIZE
+from fyl import Fly
+from fyl.container import CHUNK_PAYLOAD_SIZE
 
 
 SIZES = [

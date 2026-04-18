@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for the fly test suite.
+"""Shared pytest fixtures for the fyl test suite.
 
 Keeps per-test setup boilerplate small so new tests can be written
 cheaply, and every test stays well under the 1s budget from TODO.md.
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from fly import KDF, FileWrapper, Fly, KDFParams
+from fyl import KDF, FileWrapper, Fly, KDFParams
 
 
 @dataclass

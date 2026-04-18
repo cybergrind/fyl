@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from fly.storage import CoverStorage, FileWrapper, Storage
+from fyl.storage import CoverStorage, FileWrapper, Storage
 
 
 def _make_filewrapper(tmp_path, name='backing', content=b''):

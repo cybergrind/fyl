@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fly.storage import FileWrapper, Storage
+from fyl.storage import FileWrapper, Storage
 
 
 HEADER_SIZE = 16

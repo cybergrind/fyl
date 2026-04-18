@@ -25,14 +25,14 @@ from typing import Any
 
 import fuse
 
-from fly.container import Container
-from fly.crypto import KDF
-from fly.slot_table import PasswordDoesNotMatch
-from fly.storage import CoverStorage, FileWrapper
-from fly.volume import Volume
+from fyl.container import Container
+from fyl.crypto import KDF
+from fyl.slot_table import PasswordDoesNotMatch
+from fyl.storage import CoverStorage, FileWrapper
+from fyl.volume import Volume
 
 
-log = logging.getLogger('fly')
+log = logging.getLogger('fyl')
 fuse.fuse_python_api = (0, 2)
 TIME_PAT = re.compile(r'.*\/\d+\.\d+')
 
@@ -43,7 +43,7 @@ if not hasattr(fuse, '__version__'):
 def _configure_logging(debug: bool) -> None:
     """Set up logging only when the app actually runs.
 
-    Doing this at import time would (a) spam /tmp/fly.log whenever the
+    Doing this at import time would (a) spam /tmp/fyl.log whenever the
     package is imported by a test or a library user, and (b) leak
     filenames/offsets via ``log.debug`` calls even when ``--debug`` was
     not requested. Gate everything behind an explicit call from
@@ -52,7 +52,7 @@ def _configure_logging(debug: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        filename='/tmp/fly.log',
+        filename='/tmp/fyl.log',
     )
     update_log_level(logging.DEBUG if debug else logging.INFO)
 
@@ -268,7 +268,7 @@ def mount(args, password: str = '') -> None:
     )
     f.add_args(args, password=password)
     f.parser.add_option(mountopt=args.mountpoint, metavar='PATH', default=args.mountpoint)
-    f.main(['fly.py', str(args.mountpoint)])
+    f.main(['fyl.py', str(args.mountpoint)])
 
 
 def _ensure_mountpoint(mountpoint: Path) -> None:
@@ -333,10 +333,12 @@ def _unmount_stale(
         log.warning('failed to clean up stale mount at %s: %s', mountpoint, exc)
 
 
-def main() -> None:
-    args = parse_args()
-    _configure_logging(args.debug)
+def run_mount(args) -> None:
+    """Mount ``args.fname`` at ``args.mountpoint``. Caller handles argv+logging.
 
+    Split out of ``main`` so the unified ``fyl`` CLI can call the same
+    post-parse flow after dispatching from its subparser.
+    """
     if not args.fname.exists():
         log.error('File %s does not exist', args.fname)
         raise SystemExit(1)
@@ -352,6 +354,12 @@ def main() -> None:
     except PasswordDoesNotMatch:
         log.error('password does not match any slot and no free slots remain')
         raise SystemExit(1) from None
+
+
+def main() -> None:
+    args = parse_args()
+    _configure_logging(args.debug)
+    run_mount(args)
 
 
 if __name__ == '__main__':

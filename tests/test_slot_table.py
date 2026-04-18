@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import pytest
 
-from fly.container import N_SLOTS, Container
-from fly.crypto import KDF, KDFParams
-from fly.slot_table import FLAG_FREE, FLAG_OCCUPIED, PasswordDoesNotMatch, SlotTable
-from fly.storage import FileWrapper
+from fyl.container import N_SLOTS, Container
+from fyl.crypto import KDF, KDFParams
+from fyl.slot_table import FLAG_FREE, FLAG_OCCUPIED, PasswordDoesNotMatch, SlotTable
+from fyl.storage import FileWrapper
 
 
 @pytest.fixture

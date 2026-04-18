@@ -12,7 +12,7 @@ import struct
 from dataclasses import dataclass
 
 
-log = logging.getLogger('fly.legacy_fs')
+log = logging.getLogger('fyl.legacy_fs')
 
 MAGIC_BYTES = b'0FLYFMT0'
 

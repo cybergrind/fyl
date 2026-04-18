@@ -14,10 +14,10 @@ from __future__ import annotations
 import os
 import struct
 
-from fly.container import CHUNK_PAYLOAD_SIZE, Container
-from fly.crypto import KDF, AEADChunk
-from fly.file_index import VolumeFile, parse, serialize
-from fly.slot_table import SlotInfo, SlotTable
+from fyl.container import CHUNK_PAYLOAD_SIZE, Container
+from fyl.crypto import KDF, AEADChunk
+from fyl.file_index import VolumeFile, parse, serialize
+from fyl.slot_table import SlotInfo, SlotTable
 
 
 class VolumeCorrupt(Exception):
@@ -38,6 +38,30 @@ INDEX_MAGIC = b'FIDXv001'
 INDEX_HEADER_SIZE = len(INDEX_MAGIC) + 8
 INDEX_PAYLOAD_SIZE = CHUNK_PAYLOAD_SIZE - INDEX_HEADER_SIZE
 INDEX_CHAIN_END = 0xFFFF_FFFF_FFFF_FFFF
+
+
+def write_index_chain(container: Container, cipher: AEADChunk, blob: bytes) -> int:
+    """Append the serialised index as a chain of versioned chunks.
+
+    Each chunk's plaintext is ``INDEX_MAGIC || next_cid || page ||
+    zero_pad`` filling the full chunk payload. Pages are appended in
+    reverse so every non-tail chunk already knows its successor's id
+    by the time it is sealed. Returns the *head* chunk id (what the
+    slot should point at).
+    """
+    if blob == b'':
+        pages: list[bytes] = [b'']
+    else:
+        pages = [blob[i : i + INDEX_PAYLOAD_SIZE] for i in range(0, len(blob), INDEX_PAYLOAD_SIZE)]
+    next_cid = INDEX_CHAIN_END
+    for page in reversed(pages):
+        padded_page = page + b'\x00' * (INDEX_PAYLOAD_SIZE - len(page))
+        assert len(padded_page) == INDEX_PAYLOAD_SIZE
+        plaintext = INDEX_MAGIC + struct.pack('>Q', next_cid) + padded_page
+        assert len(plaintext) == CHUNK_PAYLOAD_SIZE
+        frame = cipher.seal(plaintext)
+        next_cid = container.append_chunk(frame)
+    return next_cid
 
 
 class Volume:
@@ -263,27 +287,7 @@ class Volume:
             )
 
     def _write_index_chain(self, blob: bytes) -> int:
-        """Append the serialised index as a chain of versioned chunks.
-
-        Each chunk's plaintext is
-        ``INDEX_MAGIC || next_cid || page || zero_pad`` to the full
-        chunk payload size. Pages are appended in reverse so every
-        non-tail chunk already knows its successor's id by the time it
-        is sealed. Returns the *head* chunk id (what the slot should
-        point at).
-        """
-        if blob == b'':
-            pages: list[bytes] = [b'']
-        else:
-            pages = [blob[i : i + INDEX_PAYLOAD_SIZE] for i in range(0, len(blob), INDEX_PAYLOAD_SIZE)]
-        next_cid = INDEX_CHAIN_END
-        for page in reversed(pages):
-            padded_page = page + b'\x00' * (INDEX_PAYLOAD_SIZE - len(page))
-            assert len(padded_page) == INDEX_PAYLOAD_SIZE
-            plaintext = INDEX_MAGIC + struct.pack('>Q', next_cid) + padded_page
-            assert len(plaintext) == CHUNK_PAYLOAD_SIZE
-            next_cid = self._append_plaintext(plaintext)
-        return next_cid
+        return write_index_chain(self.container, self._cipher, blob)
 
     def _reserve_slot_for_associate(self) -> int:
         """Return the slot index to associate on the first commit.

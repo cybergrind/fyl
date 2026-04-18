@@ -1,11 +1,11 @@
-"""fly package - FUSE-based single-file filesystem.
+"""fyl package - FUSE-based single-file filesystem (formerly ``fly``).
 
 Public API is re-exported here so callers and tests can continue to do
-``from fly import ...``. Implementation is split across submodules to
+``from fyl import ...``. Implementation is split across submodules to
 leave room for the crypto stack.
 """
 
-from fly.container import (
+from fyl.container import (
     CHUNK_FRAME_SIZE,
     CHUNK_PAYLOAD_SIZE,
     DATA_START,
@@ -16,9 +16,9 @@ from fly.container import (
     Container,
     ContainerCorrupt,
 )
-from fly.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk, KDFParams
-from fly.file_index import FileIndexCorrupt, VolumeFile
-from fly.fuse_app import (
+from fyl.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk, KDFParams
+from fyl.file_index import FileIndexCorrupt, VolumeFile
+from fyl.fuse_app import (
     TIME_PAT,
     Fly,
     MyStat,
@@ -30,10 +30,10 @@ from fly.fuse_app import (
     parse_args,
     update_log_level,
 )
-from fly.legacy_fs import MAGIC_BYTES, FileRecord, FileStructure
-from fly.slot_table import FLAG_FREE, FLAG_OCCUPIED, PasswordDoesNotMatch, SlotInfo, SlotTable
-from fly.storage import CoverStorage, FileWrapper, Storage
-from fly.volume import Volume, VolumeCorrupt
+from fyl.legacy_fs import MAGIC_BYTES, FileRecord, FileStructure
+from fyl.slot_table import FLAG_FREE, FLAG_OCCUPIED, PasswordDoesNotMatch, SlotInfo, SlotTable
+from fyl.storage import CoverStorage, FileWrapper, Storage
+from fyl.volume import Volume, VolumeCorrupt
 
 
 __all__ = [
