@@ -8,6 +8,7 @@ supplies the test-grade ``KDFParams.fast()`` preset and a chosen
 ``password`` (empty by default -> slot 0).
 """
 
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,6 +81,61 @@ def make_fly(backing_file, fast_kdf):
         return fly, path, reopen
 
     return _make
+
+
+class MultiFly:
+    """Test helper for driving several passwords against one backing file.
+
+    Hides the boilerplate of constructing ``Fly`` / ``FakeArgs`` / ``KDF``
+    and provides an honest ``unmount_all`` that actually releases the
+    Python-side file handles. Fly participates in a reference cycle
+    (via ``fuse.Fuse``) so ``del`` alone does not drop the object; we
+    close the ``FileWrapper`` read handle explicitly and then force
+    cyclic GC so a subsequent ``mount`` opens an independent view of
+    the on-disk container.
+    """
+
+    def __init__(self, path: Path, kdf: KDF) -> None:
+        self.path = path
+        self.kdf = kdf
+        self._live: list[Fly] = []
+
+    def mount(self, password: str = '') -> Fly:
+        fly = Fly()
+        fly.add_args(FakeArgs(fname=self.path), password=password, kdf=self.kdf)
+        self._live.append(fly)
+        return fly
+
+    def unmount_all(self) -> None:
+        for fly in self._live:
+            handle = getattr(fly.storage, 'read_handle', None)
+            if handle is not None and not handle.closed:
+                handle.close()
+        self._live.clear()
+        gc.collect()
+
+    def remount(self, password: str = '') -> Fly:
+        """Unmount every live Fly and return a fresh mount for ``password``."""
+        self.unmount_all()
+        return self.mount(password)
+
+
+@pytest.fixture
+def multi_fly(backing_file, fast_kdf):
+    """Drive several passwords against one backing file via ``MultiFly``.
+
+    The fixture yields a ``MultiFly`` whose ``mount(password)`` opens a
+    fresh ``Fly`` over the shared backing file. ``unmount_all`` and
+    ``remount`` release handles cleanly so tests can assert
+    persistence without leaking low-level cleanup into the test body.
+    The fixture also unmounts anything still live at teardown.
+    """
+    path = backing_file(name='multi_fly_file')
+    mfly = MultiFly(path, fast_kdf)
+    try:
+        yield mfly
+    finally:
+        mfly.unmount_all()
 
 
 @pytest.fixture
