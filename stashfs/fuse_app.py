@@ -397,6 +397,11 @@ def run_mount(args) -> None:
 
     Split out of ``main`` so the unified ``stashfs`` CLI can call the same
     post-parse flow after dispatching from its subparser.
+
+    Password sourcing: if the ``SP`` environment variable is set, its
+    value is used verbatim (empty string counted) and the interactive
+    prompt is skipped. Otherwise fall back to ``getpass``. Useful for
+    automation / mounting from cron where ``getpass`` would hang.
     """
     if not args.fname.exists():
         log.error('File %s does not exist', args.fname)
@@ -405,9 +410,10 @@ def run_mount(args) -> None:
     _unmount_stale(args.mountpoint)
     _ensure_mountpoint(args.mountpoint)
 
-    # Always prompt. An empty string is a real, valid password bound to
-    # slot 0 - a convenient "no password" mode.
-    password = getpass.getpass('Press enter: ')
+    # ``SP`` env var skips the interactive prompt (empty string counts
+    # as a real password = slot 0). Fall back to getpass when unset.
+    env_pw = os.environ.get('SP')
+    password = env_pw if env_pw is not None else getpass.getpass('Press enter: ')
     try:
         mount(args, password=password)
     except PasswordDoesNotMatch:

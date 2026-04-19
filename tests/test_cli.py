@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from stashfs.cli import build_parser, main
@@ -29,6 +31,86 @@ class TestCLIParser:
 
         reopened = multi_stash.mount('alpha')
         assert reopened.read('/f', 5, 0) == b'hello'
+
+
+class TestSPEnvPassword:
+    """``SP`` env var short-circuits interactive password prompts."""
+
+    def test_mount_uses_sp_env(self, tmp_path, monkeypatch):
+        """``run_mount`` must read ``SP`` instead of calling ``getpass``."""
+        from stashfs.fuse_app import run_mount
+
+        backing = tmp_path / 'backing'
+        backing.touch()
+        mountpoint = tmp_path / 'mnt'
+        mountpoint.mkdir()
+
+        captured: dict[str, str] = {}
+
+        def fake_mount(args, password=''):
+            captured['password'] = password
+
+        def must_not_prompt(_msg=''):
+            raise AssertionError('getpass must not be called when SP is set')
+
+        monkeypatch.setenv('SP', 'my-secret')
+        monkeypatch.setattr('stashfs.fuse_app.getpass.getpass', must_not_prompt)
+        monkeypatch.setattr('stashfs.fuse_app.mount', fake_mount)
+        monkeypatch.setattr('stashfs.fuse_app._unmount_stale', lambda *_a, **_k: None)
+
+        args = types.SimpleNamespace(fname=backing, mountpoint=mountpoint)
+        run_mount(args)
+        assert captured['password'] == 'my-secret'
+
+    def test_mount_falls_back_to_prompt_when_sp_unset(self, tmp_path, monkeypatch):
+        """Without ``SP`` the existing ``getpass`` prompt still runs."""
+        from stashfs.fuse_app import run_mount
+
+        backing = tmp_path / 'backing'
+        backing.touch()
+        mountpoint = tmp_path / 'mnt'
+        mountpoint.mkdir()
+
+        captured: dict[str, str] = {}
+        prompted = {'n': 0}
+
+        def fake_mount(args, password=''):
+            captured['password'] = password
+
+        def fake_getpass(_msg=''):
+            prompted['n'] += 1
+            return 'from-prompt'
+
+        monkeypatch.delenv('SP', raising=False)
+        monkeypatch.setattr('stashfs.fuse_app.getpass.getpass', fake_getpass)
+        monkeypatch.setattr('stashfs.fuse_app.mount', fake_mount)
+        monkeypatch.setattr('stashfs.fuse_app._unmount_stale', lambda *_a, **_k: None)
+
+        args = types.SimpleNamespace(fname=backing, mountpoint=mountpoint)
+        run_mount(args)
+        assert prompted['n'] == 1
+        assert captured['password'] == 'from-prompt'
+
+    def test_optimize_cli_uses_sp_env_with_drop_locked(self, multi_stash, fast_kdf, monkeypatch):
+        """``--drop-locked`` with ``SP`` set skips the interactive prompt
+        and uses the env value as the password to try against slots."""
+        alpha = multi_stash.mount('alpha')
+        assert alpha.write('/secret', b'hidden', 0) == 6
+        multi_stash.unmount_all()
+
+        def must_not_prompt(_msg=''):
+            raise AssertionError('getpass must not be called when SP is set')
+
+        monkeypatch.setenv('SP', 'alpha')
+        monkeypatch.setattr('stashfs.cli.getpass.getpass', must_not_prompt)
+        monkeypatch.setattr('stashfs.cli._build_kdf', lambda _args: fast_kdf)
+
+        rc = main(['optimize', str(multi_stash.path), '--drop-locked'])
+        assert rc == 0
+
+        # Slot was unlockable via SP, so it was preserved (not dropped).
+        reopened = multi_stash.mount('alpha')
+        assert reopened.read('/secret', 6, 0) == b'hidden'
 
 
 class TestOptimizeCLIPasswordless:

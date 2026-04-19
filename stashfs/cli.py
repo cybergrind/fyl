@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -111,11 +112,18 @@ def _run_optimize(args: argparse.Namespace) -> int:
         return 1
 
     passwords = list(args.password)
-    # Only prompt when --drop-locked is set: the user has opted in to a
-    # destructive action and must distinguish "truly locked" from "I
-    # just forgot to pass --password". Without --drop-locked, optimize
-    # is non-destructive and needs no password at all — locked slots
-    # pass through untouched.
+    # SP env var contributes a password (useful for scripting); it's
+    # additive to --password flags so users can supply multiple
+    # passwords via a mix of both.
+    env_pw = os.environ.get('SP')
+    if env_pw is not None and env_pw not in passwords:
+        passwords.append(env_pw)
+    # Only prompt when --drop-locked is set AND nothing supplied
+    # password(s): the user has opted in to a destructive action and
+    # must distinguish "truly locked" from "I just forgot to pass
+    # --password". Without --drop-locked, optimize is non-destructive
+    # and needs no password at all — locked slots pass through
+    # untouched.
     if args.drop_locked and not passwords:
         while True:
             pw = getpass.getpass('Password (enter on empty line to finish): ')
